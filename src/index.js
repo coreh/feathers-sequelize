@@ -219,7 +219,7 @@ class Service {
         }
       });
 
-      return instance.update(copy, options).then(instance => {
+      return instance.update(copy, { raw: false }).then(instance => {
         if (options.raw === false) {
           return instance;
         }
