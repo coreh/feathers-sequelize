@@ -4,6 +4,7 @@ import filter from 'feathers-query-filters';
 import errors from 'feathers-errors';
 import { select } from 'feathers-commons';
 import * as utils from './utils';
+import { Op } from 'sequelize';
 
 class Service {
   constructor (options) {
@@ -11,22 +12,52 @@ class Service {
       throw new Error('Sequelize options have to be provided');
     }
 
-    if (!options.Model) {
-      throw new Error('You must provide a Sequelize Model');
+    if (!options.model) {
+      throw new Error('You must provide a Sequelize model name');
+    }
+
+    if (!options.master) {
+      throw new Error('You must provide a Sequelize master instance');
     }
 
     this.paginate = options.paginate || {};
-    this.Model = options.Model;
+    this.model = options.model;
+    this.master = options.master;
+    this.replicas = options.replicas;
     this.id = options.id || 'id';
     this.events = options.events;
     this.raw = options.raw !== false;
   }
 
-  applyScope (params) {
-    if ((params.sequelize || {}).scope) {
-      return this.Model.scope(params.sequelize.scope);
+  decideServer (method) {
+    if (this.replicas && (this.replicas.length > 0) && (method === 'find' || method === 'get')) {
+      // Read queries go to replicas
+      return this.replicas[Math.floor(Math.random() * this.replicas.length)];
+    } else {
+      // Write queries go to master
+      return this.master;
     }
-    return this.Model;
+  }
+
+  computeSequelizeParam (sequelize, server) {
+    if (typeof sequelize === 'function') {
+      return sequelize(server);
+    }
+    return sequelize || {};
+  }
+
+  applyScope (params, server) {
+    let Model;
+
+    const sequelize = this.computeSequelizeParam(params.sequelize, server);
+
+    Model = server.model(this.model);
+
+    if (sequelize.scope) {
+      return Model.scope(sequelize.scope);
+    }
+
+    return Model;
   }
 
   extend (obj) {
@@ -34,6 +65,7 @@ class Service {
   }
 
   _find (params, getFilter = filter) {
+    const server = this.decideServer('find');
     const { filters, query } = getFilter(params.query || {});
     const where = utils.getWhere(query);
     const order = utils.getOrder(filters.$sort);
@@ -44,13 +76,13 @@ class Service {
       limit: filters.$limit,
       offset: filters.$skip,
       raw: this.raw
-    }, params.sequelize);
+    }, this.computeSequelizeParam(params.sequelize, server));
 
     if (filters.$select) {
       q.attributes = filters.$select;
     }
 
-    let Model = this.applyScope(params);
+    let Model = this.applyScope(params, server);
 
     return Model.findAndCount(q).then(result => {
       return {
@@ -74,15 +106,16 @@ class Service {
   }
 
   _get (id, params) {
+    const server = this.decideServer('get');
     const where = utils.getWhere(params.query);
 
     // Attach 'where' constraints, if any were used.
     const q = Object.assign({
       raw: this.raw,
-      where: Object.assign({[this.id]: id}, where)
-    }, params.sequelize);
+      where: Object.assign({ [this.id]: id }, where)
+    }, this.computeSequelizeParam(params.sequelize, server));
 
-    let Model = this.applyScope(params);
+    let Model = this.applyScope(params, server);
 
     // findById calls findAll under the hood. We use findAll so that
     // eager loading can be used without a separate code path.
@@ -112,17 +145,18 @@ class Service {
   }
 
   create (data, params) {
-    const options = Object.assign({raw: this.raw}, params.sequelize);
+    const server = this.decideServer('create');
+    const options = Object.assign({ raw: this.raw }, this.computeSequelizeParam(params.sequelize, server));
     // Model.create's `raw` option is different from other methods.
     // In order to use `raw` consistently to serialize the result,
     // we need to shadow the Model.create use of raw, which we provide
     // access to by specifying `ignoreSetters`.
     const ignoreSetters = Boolean(options.ignoreSetters);
-    const createOptions = Object.assign({}, options, {raw: ignoreSetters});
+    const createOptions = Object.assign({}, options, { raw: ignoreSetters });
     const isArray = Array.isArray(data);
     let promise;
 
-    let Model = this.applyScope(params);
+    let Model = this.applyScope(params, server);
 
     if (isArray) {
       promise = Model.bulkCreate(data, createOptions);
@@ -142,17 +176,54 @@ class Service {
     }).catch(utils.errorHandler);
   }
 
+  _patch (id, data, params) {
+    const server = this.decideServer('patch');
+    const options = Object.assign({ raw: this.raw }, this.computeSequelizeParam(params.sequelize, server));
+
+    if (Array.isArray(data)) {
+      return Promise.reject(new errors.BadRequest('Not replacing multiple records.'));
+    }
+
+    let Model = this.applyScope(params, server);
+
+    // Force the {raw: false} option as the instance is needed to properly
+    // update
+    return Model.findById(id, { raw: false }).then(instance => {
+      if (!instance) {
+        throw new errors.NotFound(`No record found for id '${id}'`);
+      }
+
+      let copy = {};
+      Object.keys(instance.toJSON()).forEach(key => {
+        if (typeof data[key] !== 'undefined') {
+          copy[key] = data[key];
+        }
+      });
+
+      return instance.update(copy, { raw: false }).then(instance => {
+        if (options.raw === false) {
+          return instance;
+        }
+        return instance.toJSON();
+      });
+    })
+      .then(select(params, this.id))
+      .catch(utils.errorHandler);
+  }
+
   patch (id, data, params) {
+    const server = this.decideServer('patch');
     const where = Object.assign({}, filter(params.query || {}).query);
     const mapIds = page => page.data.map(current => current[this.id]);
 
     if (id !== null) {
-      where[this.id] = id;
+      // single instance
+      return this._patch(id, data, params)
     }
 
-    const options = Object.assign({}, params.sequelize, { where });
+    const options = Object.assign({}, this.computeSequelizeParam(params.sequelize, server), { where });
 
-    let Model = this.applyScope(params);
+    let Model = this.applyScope(params, server);
 
     // This is the best way to implement patch in sql, the other dialects 'should' use a transaction.
     if (Model.sequelize.options.dialect === 'postgres') {
@@ -177,14 +248,14 @@ class Service {
     // we create a list of the ids of all items that will be changed
     // to re-query them after the update
     const ids = id === null ? this._find(params)
-        .then(mapIds) : Promise.resolve([ id ]);
+        .then(mapIds) : Promise.resolve([id]);
 
     return ids
       .then(idList => {
         // Create a new query that re-queries all ids that
         // were originally changed
         const findParams = Object.assign({}, params, {
-          query: { [this.id]: { $in: idList } }
+          query: { [this.id]: { [Op.in]: idList } }
         });
 
         return Model.update(omit(data, this.id), options)
@@ -195,13 +266,14 @@ class Service {
   }
 
   update (id, data, params) {
-    const options = Object.assign({ raw: this.raw }, params.sequelize);
+    const server = this.decideServer('update');
+    const options = Object.assign({ raw: this.raw }, this.computeSequelizeParam(params.sequelize, server));
 
     if (Array.isArray(data)) {
       return Promise.reject(new errors.BadRequest('Not replacing multiple records. Did you mean `patch`?'));
     }
 
-    let Model = this.applyScope(params);
+    let Model = this.applyScope(params, server);
 
     // Force the {raw: false} option as the instance is needed to properly
     // update
@@ -219,7 +291,7 @@ class Service {
         }
       });
 
-      return instance.update(copy, options).then(instance => {
+      return instance.update(copy, { raw: false }).then(instance => {
         if (options.raw === false) {
           return instance;
         }
@@ -231,6 +303,7 @@ class Service {
   }
 
   remove (id, params) {
+    const server = this.decideServer('remove');
     const opts = Object.assign({ raw: this.raw }, params);
     return this._getOrFind(id, opts).then(data => {
       const where = Object.assign({}, filter(params.query || {}).query);
@@ -239,18 +312,18 @@ class Service {
         where[this.id] = id;
       }
 
-      const options = Object.assign({}, params.sequelize, { where });
+      const options = Object.assign({}, this.computeSequelizeParam(params.sequelize, server), { where });
 
-      let Model = this.applyScope(params);
+      let Model = this.applyScope(params, server);
 
       return Model.destroy(options).then(() => data);
     })
-    .then(select(params, this.id))
-    .catch(utils.errorHandler);
+      .then(select(params, this.id))
+      .catch(utils.errorHandler);
   }
 }
 
-export default function init (options) {
+export default function init(options) {
   return new Service(options);
 }
 

@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import errors from 'feathers-errors';
 import * as utils from '../src/utils';
-import Sequelize from 'sequelize';
+import Sequelize, { Op } from 'sequelize';
 
 describe('Feathers Sequelize Utils', () => {
   describe('errorHandler', () => {
@@ -108,7 +108,7 @@ describe('Feathers Sequelize Utils', () => {
     it('returns order properly converted', () => {
       let order = utils.getOrder({ name: 1, age: -1 });
 
-      expect(order).to.deep.equal([ ['name', 'ASC'], ['age', 'DESC'] ]);
+      expect(order).to.deep.equal([['name', 'ASC'], ['age', 'DESC']]);
     });
   });
 
@@ -120,15 +120,15 @@ describe('Feathers Sequelize Utils', () => {
     });
 
     it('returns where conditions properly converted', () => {
-      let where = utils.getWhere({ name: 'Joe', age: { $lte: 25 } });
+      let where = utils.getWhere({ name: 'Joe', age: { [Op.lte]: 25 } });
 
-      expect(where).to.deep.equal({ name: 'Joe', age: { $lte: 25 } });
+      expect(where).to.deep.equal({ name: 'Joe', age: { [Op.lte]: 25 } });
     });
 
     it('converts $nin to $notIn', () => {
       let where = utils.getWhere({ name: { $nin: ['Joe', 'Alice'] } });
 
-      expect(where).to.deep.equal({ name: { $notIn: ['Joe', 'Alice'] } });
+      expect(where).to.deep.equal({ name: { [Op.notIn]: ['Joe', 'Alice'] } });
     });
   });
 });

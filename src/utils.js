@@ -1,6 +1,7 @@
 import errors from 'feathers-errors';
+import { Op } from 'sequelize';
 
-export function errorHandler (error) {
+export function errorHandler(error) {
   let feathersError = error;
 
   if (error.name) {
@@ -32,16 +33,16 @@ export function errorHandler (error) {
   throw feathersError;
 }
 
-export function getOrder (sort = {}) {
+export function getOrder(sort = {}) {
   let order = [];
 
   Object.keys(sort).forEach(name =>
-    order.push([ name, parseInt(sort[name], 10) === 1 ? 'ASC' : 'DESC' ]));
+    order.push([name, parseInt(sort[name], 10) === 1 ? 'ASC' : 'DESC']));
 
   return order;
 }
 
-export function getWhere (query) {
+export function getWhere(query) {
   let where = Object.assign({}, query);
 
   if (where.$select) {
@@ -53,7 +54,7 @@ export function getWhere (query) {
     if (value && value.$nin) {
       value = Object.assign({}, value);
 
-      value.$notIn = value.$nin;
+      value[Op.notIn] = value.$nin;
       delete value.$nin;
 
       where[prop] = value;
