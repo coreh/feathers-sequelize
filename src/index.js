@@ -29,8 +29,8 @@ class Service {
     this.raw = options.raw !== false;
   }
 
-  decideServer (method) {
-    if (this.replicas && (this.replicas.length > 0) && (method === 'find' || method === 'get')) {
+  decideServer (method, params) {
+    if ((!params.forceMaster) && this.replicas && (this.replicas.length > 0) && (method === 'find' || method === 'get')) {
       // Read queries go to replicas
       return this.replicas[Math.floor(Math.random() * this.replicas.length)];
     } else {
@@ -65,7 +65,7 @@ class Service {
   }
 
   _find (params, getFilter = filter) {
-    const server = this.decideServer('find');
+    const server = this.decideServer('find', params);
     const { filters, query } = getFilter(params.query || {});
     const where = utils.getWhere(query);
     const order = utils.getOrder(filters.$sort);
@@ -106,7 +106,7 @@ class Service {
   }
 
   _get (id, params) {
-    const server = this.decideServer('get');
+    const server = this.decideServer('get', params);
     const where = utils.getWhere(params.query);
 
     // Attach 'where' constraints, if any were used.
@@ -145,7 +145,7 @@ class Service {
   }
 
   create (data, params) {
-    const server = this.decideServer('create');
+    const server = this.decideServer('create', params);
     const options = Object.assign({ raw: this.raw }, this.computeSequelizeParam(params.sequelize, server));
     // Model.create's `raw` option is different from other methods.
     // In order to use `raw` consistently to serialize the result,
@@ -177,7 +177,7 @@ class Service {
   }
 
   _patch (id, data, params) {
-    const server = this.decideServer('patch');
+    const server = this.decideServer('patch', params);
     const options = Object.assign({ raw: this.raw }, this.computeSequelizeParam(params.sequelize, server));
 
     if (Array.isArray(data)) {
@@ -212,7 +212,7 @@ class Service {
   }
 
   patch (id, data, params) {
-    const server = this.decideServer('patch');
+    const server = this.decideServer('patch', params);
     const where = Object.assign({}, filter(params.query || {}).query);
     const mapIds = page => page.data.map(current => current[this.id]);
 
@@ -266,7 +266,7 @@ class Service {
   }
 
   update (id, data, params) {
-    const server = this.decideServer('update');
+    const server = this.decideServer('update', params);
     const options = Object.assign({ raw: this.raw }, this.computeSequelizeParam(params.sequelize, server));
 
     if (Array.isArray(data)) {
@@ -303,7 +303,7 @@ class Service {
   }
 
   remove (id, params) {
-    const server = this.decideServer('remove');
+    const server = this.decideServer('remove', params);
     const opts = Object.assign({ raw: this.raw }, params);
     return this._getOrFind(id, opts).then(data => {
       const where = Object.assign({}, filter(params.query || {}).query);
