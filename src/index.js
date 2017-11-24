@@ -46,12 +46,16 @@ class Service {
     return sequelize || {};
   }
 
+  getModel (params) {
+    return this.Model;
+  }
+
   applyScope (params, server) {
     let Model;
 
     const sequelize = this.computeSequelizeParam(params.sequelize, server);
 
-    Model = server.model(this.model);
+    Model = this.getModel(params);
 
     if (sequelize.scope) {
       return Model.scope(sequelize.scope);
@@ -60,11 +64,15 @@ class Service {
     return Model;
   }
 
+  getModel (params) {
+    return server.model(this.model);
+  }
+
   extend (obj) {
     return Proto.extend(obj, this);
   }
 
-  _find (params, getFilter = filter) {
+  _find (params, getFilter = filter, paginate) {
     const server = this.decideServer('find', params);
     const { filters, query } = getFilter(params.query || {});
     const where = utils.getWhere(query);
@@ -75,7 +83,8 @@ class Service {
       order,
       limit: filters.$limit,
       offset: filters.$skip,
-      raw: this.raw
+      raw: this.raw,
+      distinct: true
     }, this.computeSequelizeParam(params.sequelize, server));
 
     if (filters.$select) {
@@ -84,19 +93,39 @@ class Service {
 
     let Model = this.applyScope(params, server);
 
-    return Model.findAndCount(q).then(result => {
-      return {
-        total: result.count,
-        limit: filters.$limit,
-        skip: filters.$skip || 0,
-        data: result.rows
-      };
-    }).catch(utils.errorHandler);
+    // Until Sequelize fix all the findAndCount issues, a few 'hacks' are needed to get the total count correct
+
+    // Adding an empty include changes the way the count is done
+    // See: https://github.com/sequelize/sequelize/blob/7e441a6a5ca44749acd3567b59b1d6ceb06ae64b/lib/model.js#L1780-L1782
+    q.include = q.include || [];
+
+    // Non-raw is the default but setting it manually breaks paging
+    // See: https://github.com/sequelize/sequelize/issues/7931
+    if (q.raw === false) {
+      delete q.raw;
+    }
+
+    if (paginate) {
+      return Model.findAndCountAll(q).then(result => {
+        return {
+          total: result.count,
+          limit: filters.$limit,
+          skip: filters.$skip || 0,
+          data: result.rows
+        };
+      }).catch(utils.errorHandler);
+    } else {
+      return Model.findAll(q).then(result => {
+        return {
+          data: result
+        };
+      }).catch(utils.errorHandler);
+    }
   }
 
   find (params) {
     const paginate = (params && typeof params.paginate !== 'undefined') ? params.paginate : this.paginate;
-    const result = this._find(params, where => filter(where, paginate));
+    const result = this._find(params, where => filter(where, paginate), paginate);
 
     if (!paginate.default) {
       return result.then(page => page.data);
@@ -127,7 +156,9 @@ class Service {
       return result[0];
     })
     .then(select(params, this.id))
-    .catch(utils.errorHandler);
+    .catch(error => {
+      throw new errors.NotFound(`No record found for id '${id}'`, error);
+    });
   }
 
   // returns either the model intance for an id or all unpaginated
@@ -221,27 +252,29 @@ class Service {
       return this._patch(id, data, params)
     }
 
-    const options = Object.assign({}, this.computeSequelizeParam(params.sequelize, server), { where });
+    const options = Object.assign({raw: this.raw}, this.computeSequelizeParam(params.sequelize, server), { where });
 
     let Model = this.applyScope(params, server);
 
     // This is the best way to implement patch in sql, the other dialects 'should' use a transaction.
-    if (Model.sequelize.options.dialect === 'postgres') {
+    if (Model.sequelize.options.dialect === 'postgres' && params.$returning !== false) {
       options.returning = true;
-      return Model.update(omit(data, this.id), options)
-            .then(results => {
-              if (id === null) {
-                return results[1];
-              }
 
-              if (!results[1].length) {
-                throw new errors.NotFound(`No record found for id '${id}'`);
-              }
+      return this._getOrFind(id, params)
+        .then(results => this.getModel(params).update(omit(data, this.id), options))
+          .then(results => {
+            if (id === null) {
+              return results[1];
+            }
 
-              return results[1][0];
-            })
-            .then(select(params, this.id))
-            .catch(utils.errorHandler);
+            if (!results[1].length) {
+              throw new errors.NotFound(`No record found for id '${id}'`);
+            }
+
+            return results[1][0];
+          })
+          .then(select(params, this.id))
+          .catch(utils.errorHandler);
     }
 
     // By default we will just query for the one id. For multi patch
@@ -259,7 +292,13 @@ class Service {
         });
 
         return Model.update(omit(data, this.id), options)
-            .then(() => this._getOrFind(id, findParams));
+            .then(() => {
+              if (params.$returning !== false) {
+                return this._getOrFind(id, findParams);
+              } else {
+                return Promise.resolve([]);
+              }
+            });
       })
       .then(select(params, this.id))
       .catch(utils.errorHandler);
@@ -273,11 +312,10 @@ class Service {
       return Promise.reject(new errors.BadRequest('Not replacing multiple records. Did you mean `patch`?'));
     }
 
-    let Model = this.applyScope(params, server);
-
     // Force the {raw: false} option as the instance is needed to properly
     // update
-    return Model.findById(id, { raw: false }).then(instance => {
+
+    return this._get(id, { sequelize: { raw: false } }).then(instance => {
       if (!instance) {
         throw new errors.NotFound(`No record found for id '${id}'`);
       }
@@ -291,12 +329,7 @@ class Service {
         }
       });
 
-      return instance.update(copy, { raw: false }).then(instance => {
-        if (options.raw === false) {
-          return instance;
-        }
-        return instance.toJSON();
-      });
+      return instance.update(copy, {raw: false}).then(() => this._get(id, {sequelize: options}));
     })
     .then(select(params, this.id))
     .catch(utils.errorHandler);
@@ -305,21 +338,27 @@ class Service {
   remove (id, params) {
     const server = this.decideServer('remove', params);
     const opts = Object.assign({ raw: this.raw }, params);
-    return this._getOrFind(id, opts).then(data => {
-      const where = Object.assign({}, filter(params.query || {}).query);
+    const where = Object.assign({}, filter(params.query || {}).query);
 
-      if (id !== null) {
-        where[this.id] = id;
-      }
+    if (id !== null) {
+      where[this.id] = id;
+    }
 
-      const options = Object.assign({}, this.computeSequelizeParam(params.sequelize, server), { where });
+    const options = Object.assign({}, this.computeSequelizeParam(params.sequelize, server), { where });
 
-      let Model = this.applyScope(params, server);
+    let Model = this.applyScope(params, server);
 
-      return Model.destroy(options).then(() => data);
-    })
-      .then(select(params, this.id))
-      .catch(utils.errorHandler);
+    if (params.$returning !== false) {
+      return this._getOrFind(id, opts).then(data => {
+        return Model.destroy(options).then(() => data);
+      })
+        .then(select(params, this.id))
+        .catch(utils.errorHandler);
+    } else {
+      return Model.destroy(options).then(() => Promise.resolve([]))
+        .then(select(params, this.id))
+        .catch(utils.errorHandler);
+    }
   }
 }
 
